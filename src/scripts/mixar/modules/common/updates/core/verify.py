@@ -22,6 +22,7 @@ Both checks shell out to the platform tools (``Get-AuthenticodeSignature``
 """
 
 import os
+import shutil
 import subprocess
 import sys
 
@@ -62,7 +63,11 @@ _PS_SIGNER = (
     "$ErrorActionPreference='Stop';"
     "$s=Get-AuthenticodeSignature -LiteralPath {path};"
     "Write-Output $s.Status;"
-    "if($s.SignerCertificate){Write-Output $s.SignerCertificate.Subject}"
+    # The if-body braces MUST be doubled: .format() only substitutes {path},
+    # a bare {here} would be parsed as a replacement field and raise
+    # KeyError on every Authenticode check (silently degrading every
+    # update to "unverified").
+    "if($s.SignerCertificate){{Write-Output $s.SignerCertificate.Subject}}"
 )
 
 
@@ -71,12 +76,63 @@ def _ps_quote(path):
     return "'" + str(path).replace("'", "''") + "'"
 
 
+_PS_PROBE_S = 10
+_PS_EXE = None  # None = not probed yet; "" = none available
+
+
+def _pick_powershell():
+    """Return the PowerShell executable to use, or ``""`` if none works.
+
+    Prefers ``pwsh`` (PowerShell 7): on some Windows installs the bundled
+    Windows PowerShell 5.1 cannot load ``Microsoft.PowerShell.Security``
+    when spawned as a subprocess (TypeData errors), which would silently
+    disable the signature check.  ``pwsh`` is not installed on every
+    machine, so fall back to the built-in 5.1 rather than failing.
+    The probe is one ``--version`` spawn per app session; the answer is
+    cached because it does not change while the app runs.
+    """
+    global _PS_EXE
+    if _PS_EXE is not None:
+        return _PS_EXE
+
+    def _usable(name):
+        if shutil.which(name) is None:
+            return False
+        try:
+            p = subprocess.run(
+                [name, "-NoProfile", "-NonInteractive", "--version"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                timeout=_PS_PROBE_S, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                if os.name == "nt" else 0,
+            )
+            return p.returncode == 0
+        except Exception as e:  # noqa: BLE001 - probe must never raise
+            logger.debug("PowerShell probe %s failed: %s", name, e)
+            return False
+
+    for name in ("pwsh", "powershell"):
+        if _usable(name):
+            _PS_EXE = name
+            return name
+    _PS_EXE = ""
+    return ""
+
+
+def _ps_argv(exe, command):
+    return [
+        exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command", command,
+    ]
+
+
 def _authenticode(path):
     """Return (status, signer_subject) for *path*, or None if unavailable."""
-    result = _run([
-        "powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-        "-Command", _PS_SIGNER.format(path=_ps_quote(path)),
-    ])
+    exe = _pick_powershell()
+    if not exe:
+        logger.debug("No working PowerShell found for Authenticode check")
+        return None
+    result = _run(_ps_argv(exe, _PS_SIGNER.format(path=_ps_quote(path))))
     if result is None:
         return None
     code, output = result
