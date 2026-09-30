@@ -328,6 +328,24 @@ def _process_one_request() -> Optional[float]:
     # tick's bpy work holds the main thread (busy != frozen).
     _set_inflight(req.tool_name, req.request_id, req.session_id)
 
+    # Mixar gate: normalize stock-Blender idioms + validate every attribute
+    # against the binary-dumped truth table BEFORE any dispatch. A rejection
+    # is a normal tool error — the backend's self-correction loop rewrites.
+    # The first call also loads the ~40 MB truth table once (lazy).
+    from . import script_validator
+    gate_ok, gate_issues, normalized_script = script_validator.prepare_script(req.script)
+    if not gate_ok:
+        _clear_inflight()
+        err = "Script rejected by the Mixar gate before execution:\n" + "\n".join(gate_issues)
+        logger.warning("Refusing %s (id: %s): %s", req.tool_name, req.request_id, err)
+        _send_error_response(req.request_id, err, "validation_error")
+        return _stop_timer_if_idle()
+    if normalized_script != req.script:
+        # Steps, history archiving and execution all record req.script, so
+        # swap in the normalized source before any of them run.
+        req.script = normalized_script
+        logger.info("Script normalized by the Mixar gate before execution")
+
     target_scene, did_switch, route_error = route_request(
         req.session_id, req.tool_name, req.request_id
     )
