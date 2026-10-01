@@ -50,6 +50,8 @@ from mixar.config.logging_config import get_logger
 from mixar.modules.common.i18n import n_
 
 from ..constants import (
+    GATE_CACHE_CLEAR_ON_NEW_GOAL,
+    GATE_CACHE_CLEAR_TIMEOUT_S,
     LOG_PREFIX,
     MAX_RELAY_REQUEST_BYTES,
     MAX_RELAY_RESPONSE_BYTES,
@@ -58,6 +60,7 @@ from ..constants import (
     RELAY_CHAT_COMPLETIONS_PATH,
     RELAY_TIMEOUT_S,
 )
+from . import message_gate
 
 logger = get_logger(__name__)
 
@@ -336,6 +339,20 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
                        f"request body exceeds {MAX_RELAY_REQUEST_BYTES} bytes"))
         return
 
+    # Native message gate: quarantine hallucinated tool_calls from the
+    # history and detect goal boundaries (fail-open — see
+    # core/message_gate.py; a gate failure must never block a turn).
+    goal_changed = False
+    try:
+        body, goal_changed = message_gate.inspect_request(bytes(body))
+    except Exception as exc:
+        logger.warning("%s message gate failed (passing through): %s",
+                       LOG_PREFIX, exc)
+    if goal_changed and GATE_CACHE_CLEAR_ON_NEW_GOAL:
+        # A new goal: drop the previous goal's KV cache on the server so
+        # the fresh context starts clean. Best-effort, silent on 404.
+        _clear_remote_cache(pinned_url)
+
     headers = _filter_request_headers(params.get("headers"))
     if host_header:
         # Connection is pinned to the resolved IP; keep the original name
@@ -377,8 +394,45 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
         respond(_error("relay_response_too_large",
                        f"response exceeds {MAX_RELAY_RESPONSE_BYTES} bytes"))
         return
+    # Log-only audit of the model output (script issues in fenced blocks
+    # and tool_call script arguments); never mutates the response.
+    try:
+        message_gate.inspect_response(raw)
+    except Exception as exc:
+        logger.debug("%s response audit skipped (%s)", LOG_PREFIX, exc)
     respond({
         "status_code": int(status),
         "headers": headers,
         "body": raw.decode("utf-8", errors="replace"),
     })
+
+
+def _clear_remote_cache(pinned_url: str) -> None:
+    """Best-effort prompt-cache clear at a goal boundary.
+
+    POSTs ``<base>/cache/clear`` on the same (already approved + pinned)
+    host. Fire-and-forget: a server without the endpoint (404) or a slow
+    one must never affect the turn — every failure is a debug log."""
+    parts = urllib.parse.urlsplit(pinned_url)
+    path = parts.path or ""
+    if path.endswith("chat/completions"):
+        path = path[: -len("chat/completions")]
+    url = urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, path + "cache/clear", "", "")
+    )
+    request = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        response = _urlopen(request, timeout=GATE_CACHE_CLEAR_TIMEOUT_S)
+    except Exception as exc:
+        logger.debug("%s cache clear skipped (%s)", LOG_PREFIX, exc)
+        return
+    try:
+        _read_bounded(response)
+    except Exception:
+        pass
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+    logger.info("%s prompt cache cleared at goal boundary", LOG_PREFIX)

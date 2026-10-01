@@ -248,6 +248,14 @@ RELAY_ALLOWED_RESPONSE_HEADERS = frozenset(
 # The only path the relay will ever hit on an approved base.
 RELAY_CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
 
+# Native LLM message gate (core/message_gate.py, wired into the relay):
+# at a goal boundary (the last user message changed) the relay clears the
+# local server's prompt cache so a fresh goal doesn't inherit the previous
+# goal's KV cache. Best-effort — a server without the endpoint (404) or a
+# slow one must never affect the turn.
+GATE_CACHE_CLEAR_ON_NEW_GOAL = True
+GATE_CACHE_CLEAR_TIMEOUT_S = 5.0
+
 # ---------------------------------------------------------------------------
 # Download policy (see core/download.py)
 # ---------------------------------------------------------------------------

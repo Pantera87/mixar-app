@@ -107,6 +107,7 @@ DB_PATH = os.path.join(SCRIPT_DIR, "blender_rag_db")
 REF_JSON = os.path.join(SCRIPT_DIR, "mixar_props.json")        # v2: full dir()-based attribute sets
 REF_TYPES_JSON = os.path.join(SCRIPT_DIR, "mixar_types.json")   # per-property type/min/max/enum
 REF_SOCK_JSON = os.path.join(SCRIPT_DIR, "mixar_sockets.json")  # per-node-class socket names
+REF_OPS_JSON = os.path.join(SCRIPT_DIR, "mixar_ops.json")      # bpy.ops categories -> operator names
 REF_META_JSON = os.path.join(SCRIPT_DIR, "mixar_meta.json")     # cache format version
 TRUTH_VERSION = 7   # v6: concrete socket classes via type(socket).__name__ + valid Mixar tree types
 
@@ -180,6 +181,7 @@ BPy_NAMES = {}     # lower-class-name -> canonical class name
 BPy_TYPES = {}     # lower-class-name -> {prop: {"type","min","max","enum":[...]}}
 BPy_SOCKETS = {}   # lower-node-class -> {"inputs": [names], "outputs": [names],
                    #                      "input_types": {name: cls}, "output_types": {name: cls}}
+BPy_OPS = {}       # operator category -> set of operator names (bpy.ops, dumped)
 _BPy_REF_LOADED = False
 
 _BPY_DUMP_EXPR = (
@@ -262,6 +264,14 @@ _BPY_DUMP_EXPR = (
     "print('__BPy_ATTRS__' + json.dumps(attrs))\n"
     "print('__BPy_TYPES__' + json.dumps(ptypes))\n"
     "print('__BPy_SOCKETS__' + json.dumps(sockets))\n"
+    "ops = {}\n"
+    "for m in dir(bpy.ops):\n"
+    "    if m[:1].islower():\n"
+    "        try:\n"
+    "            ops[m] = sorted(set(n for n in dir(getattr(bpy.ops, m)) if not n.startswith('_')))\n"
+    "        except Exception:\n"
+    "            ops[m] = []\n"
+    "print('__BPy_OPS__' + json.dumps(ops))\n"
 )
 
 
@@ -303,6 +313,15 @@ def _load_from_cache():
             print(f"✅ Socket reference loaded: {len(BPy_SOCKETS)} node classes (socket checks ON).")
         except Exception as e:
             print(f"⚠️ Could not read {REF_SOCK_JSON} ({e}) — socket checks OFF.")
+    if os.path.isfile(REF_OPS_JSON):
+        try:
+            with open(REF_OPS_JSON, "r", encoding="utf-8") as f:
+                odata = json.load(f)
+            for category, names in odata.items():
+                BPy_OPS[category] = set(names)
+            print(f"✅ Operator reference loaded: {len(BPy_OPS)} bpy.ops categories (operator checks ON).")
+        except Exception as e:
+            print(f"⚠️ Could not read {REF_OPS_JSON} ({e}) — operator checks OFF.")
     print(f"✅ Attribute reference from cache: {len(BPy_ATTRS)} classes "
           f"({sum(len(v) for v in BPy_ATTR_SETS.values())} attributes total).")
 
@@ -385,7 +404,7 @@ def _load_property_reference():
                  "--python-expr", _BPY_DUMP_EXPR],
                 capture_output=True, text=True, timeout=600,
             )
-            data, tdata, sdata = None, None, None
+            data, tdata, sdata, odata = None, None, None, None
             for line in (proc.stdout or "").splitlines():
                 if line.startswith("__BPy_ATTRS__"):
                     data = json.loads(line[len("__BPy_ATTRS__"):])
@@ -393,6 +412,8 @@ def _load_property_reference():
                     tdata = json.loads(line[len("__BPy_TYPES__"):])
                 elif line.startswith("__BPy_SOCKETS__"):
                     sdata = json.loads(line[len("__BPy_SOCKETS__"):])
+                elif line.startswith("__BPy_OPS__"):
+                    odata = json.loads(line[len("__BPy_OPS__"):])
             if data is None:
                 print(f"⚠️ Mixar dump produced no data. stderr: {(proc.stderr or '')[:500]}")
                 return
@@ -419,6 +440,11 @@ def _load_property_reference():
                     BPy_SOCKETS[name.lower()] = smap
                 with open(REF_SOCK_JSON, "w", encoding="utf-8") as f:
                     json.dump(sdata, f)
+            if odata is not None:
+                for category, names in odata.items():
+                    BPy_OPS[category] = set(names)
+                with open(REF_OPS_JSON, "w", encoding="utf-8") as f:
+                    json.dump(odata, f)
             with open(REF_META_JSON, "w", encoding="utf-8") as f:
                 json.dump({"version": TRUTH_VERSION}, f)
             print(f"✅ Truth table v2 from Mixar binary: {len(BPy_ATTRS)} classes, "
@@ -644,6 +670,33 @@ TRUSTED_CLASSES = {
     "vector", "floatvector", "intvector", "matrix", "quat", "euler",
     "color", "floatarray", "intarray", "string",
 }
+
+
+def _ops_issue(category: str, op: str):
+    """Is  bpy.ops.<category>.<op>(...)  a real operator in this build?
+
+    The operator tree is dynamic, so the chain walker deliberately
+    never checks it (see _state_of) — this is the ONLY place operator
+    names are validated, against mixar_ops.json (bpy.ops dumped from
+    the Mixar binary). Returns an issue string, or None when the call
+    is legal / the table is absent (blind, not false)."""
+    if not BPy_OPS:
+        return None
+    ops_in_cat = BPy_OPS.get(category)
+    if ops_in_cat is None:
+        close = get_close_matches(category, list(BPy_OPS), n=3, cutoff=0.4)
+        return (f"- bpy.ops.{category}.{op}: no such operator category in this "
+                f"Mixar build."
+                + (f" Did you mean: {', '.join(close)}?" if close
+                   else f" Categories: {', '.join(sorted(BPy_OPS))[:80]}.")
+                + " Delete the call or replace it with a real operator.")
+    if op in ops_in_cat:
+        return None
+    close = get_close_matches(op, sorted(ops_in_cat), n=3, cutoff=0.45)
+    return (f"- bpy.ops.{category}.{op}: no such operator in this Mixar build "
+            f"(the engine kills the call with AttributeError)."
+            + (f" Did you mean: {', '.join(close)}?" if close
+               else f" Available: {', '.join(sorted(ops_in_cat)[:12])}."))
 
 _COLLECTED = "__collection__"   # sentinel: expression is a bare collection
 _GENERIC_SOCKET = "__generic_socket__"  # sentinel: socket slot whose node class is not in the socket table
@@ -1325,6 +1378,15 @@ def validate_bpy_properties(script: str):
                          "        if obj.name.startswith('Your_Prefix_'):\n"
                          "            bpy.data.objects.remove(obj, do_unlink=True)")
         elif isinstance(node, ast.Call):
+            # bpy.ops.<category>.<op>(...) — operator NAME validation. The
+            # attribute pass skips the dynamic bpy.ops tree (see _state_of),
+            # so this is the only place operator names are checked.
+            if isinstance(node.func, ast.Attribute):
+                ochain = _chain_names(node.func)
+                if len(ochain) >= 4 and ochain[0] == "bpy" and ochain[1] == "ops":
+                    oi = _ops_issue(ochain[-2], ochain[-1])
+                    if oi:
+                        add(oi)
             # .new() on collections this build does not support (bpy.data.sounds.new, ...)
             if isinstance(node.func, ast.Attribute) and node.func.attr == "new":
                 names = _chain_names(node.func.value)
