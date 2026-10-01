@@ -142,6 +142,73 @@ errors); validation/transport failures produce
 `{"error": {"code", "message"}}` markers the WebSocket layer translates
 into JSON-RPC errors.
 
+## Stoppability (`core/relay_stop.py`)
+
+The user's Stop must kill the in-flight inference, not just close the
+conversation:
+
+- `request_stop()` latches a process-wide flag. While latched,
+  `relay.handle_llm_request` refuses every new `llm.request` *before any
+  I/O* (`relay_stopped`), and `relay_autofix` refuses its fix roundtrip —
+  no queued follow-up call (gate fix, auto-retry) ever dispatches after a
+  stop. `clear_stop()` reopens the lane on the next user intent (composer
+  send / task resume); the Stop operator calls `request_stop()` +
+  `stop_inflight()`.
+- `stop_inflight()` latches the flag AND force-closes every live
+  connection. The relay's opener (and the autofix opener) is built via
+  `build_tracked_opener`, which registers `http.client` connections
+  (`StopHTTPConnection` + the TLS variant, MRO-ordered) in a
+  lock-guarded registry. On Windows a plain `sock.close()` would NOT
+  abort the worker: `http.client` reads the body through
+  `sock.makefile()`, which pins `socket._io_refs`, and CPython ≥ 3.7
+  defers the real `closesocket()` behind that pin — a worker blocked in
+  `recv()` would keep decoding for the whole generation. `_force_close`
+  therefore closes the fd through `ws2_32.closesocket` (the exact call
+  the deferred close would have made); the blocked read unwinds with
+  `OSError` 10038 and llama.cpp aborts the decode on the dropped
+  connection. On POSIX it falls back to plain `sock.close()` (a blocked
+  read there is bounded by the request timeout).
+- A transport failure in either relay phase (open or read) is reported
+  as `relay_stopped` when the flag is latched, `relay_transport`
+  otherwise.
+- All of it is lock- and thread-safe, bpy-free, and the stop side never
+  raises.
+
+## Prefill shaping and runtime auto-retry (`message_gate.py`, `relay_autofix.py`)
+
+Both hooks run inside `handle_llm_request` on the same worker thread,
+before `_urlopen`, and both fail open (a shape they don't understand is
+relayed verbatim):
+
+- **Prefill reduction** — `message_gate.inspect_request(body)` trims the
+  request so a small local model never replays the whole conversation: it
+  keeps the system message(s) plus the last `HISTORY_TAIL` (4)
+  non-system messages, extending the window backward when it would start
+  inside a `tool` result so an assistant `tool_call` is never orphaned
+  from its answer, and head/tail-trims tool-result content above
+  `TOOL_RESULT_MAX_CHARS` (2000). Bodies already within the limits pass
+  through **byte-identical** (no re-serialization), and the same call
+  returns the goal-boundary flag that makes `relay.py` POST
+  `/cache/clear` at a new goal (404/timeout there is a debug log only).
+  `inspect_response` is a log-only audit of fenced scripts / tool-call
+  arguments (never mutates); `reset_state()` is test-only.
+- **Runtime auto-retry** — `relay_autofix.maybe_forge(body, pinned_url,
+  timeout)` fires when the last message is a tool result carrying a
+  Blender runtime traceback (timeouts are not crashes). It builds a
+  minimal fix prompt (goal + failing script + error, capped), re-checks
+  the stop flag, then runs ONE more inference against the same
+  already-pinned, approved model on a tracked opener. If the reply
+  yields a fenced script that compiles, passes
+  `script_validator.normalize/validate_bpy_properties`, and differs from
+  the last dispatched script (spin guard), it returns a complete
+  `chat/completions` envelope (`chatcmpl-auto-fix`,
+  `finish_reason: tool_calls`, `content: null`, zeroed usage) carrying
+  the corrected script in the declared exec tool; otherwise `None`
+  (plain relay). Guards: `MAX_ATTEMPTS` (2) dispatches per goal key
+  (lock-guarded dict, `reset_budget()` test-only), a declared exec tool
+  resolvable by name + code param, and any exception relays the raw
+  error.
+
 ## Fit ladder (catalog.py)
 
 `fits` when `total_file_bytes * 1.15 + 2 GiB <= total RAM`; `tight` when

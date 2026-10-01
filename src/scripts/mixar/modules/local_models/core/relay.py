@@ -41,6 +41,7 @@ bpy imports. ``_urlopen`` / ``_getaddrinfo`` are test seams.
 import ipaddress
 import socket
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -61,6 +62,8 @@ from ..constants import (
     RELAY_TIMEOUT_S,
 )
 from . import message_gate
+from . import relay_autofix
+from . import relay_stop
 
 logger = get_logger(__name__)
 
@@ -77,8 +80,10 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# Test seams. The opener never follows redirects (see _RefuseRedirects).
-_urlopen = urllib.request.build_opener(_RefuseRedirects()).open
+# Test seams. The opener never follows redirects (see _RefuseRedirects) and
+# its connections are TRACKED (core/relay_stop.py) so a user Stop can force-
+# close the in-flight socket and abort the local-model decode.
+_urlopen = relay_stop.build_tracked_opener(_RefuseRedirects).open
 _getaddrinfo = socket.getaddrinfo
 
 _lock = threading.Lock()
@@ -326,6 +331,16 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
         respond(denial)
         return
 
+    # Stopped generation: refuse follow-up LLM calls without any network
+    # I/O (the backend's queued calls of a cancelled run must not keep a
+    # local model decoding). The flag clears when the user starts a fresh
+    # generation or resumes a task (see core/relay_stop.py).
+    if relay_stop.is_stopped():
+        logger.info("%s relay stopped by user — refusing local LLM call",
+                    LOG_PREFIX)
+        respond(_error("relay_stopped", "generation stopped by the user"))
+        return
+
     body = params.get("body")
     if isinstance(body, str):
         body = body.encode("utf-8")
@@ -348,6 +363,27 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
     except Exception as exc:
         logger.warning("%s message gate failed (passing through): %s",
                        LOG_PREFIX, exc)
+
+    # Closed-loop auto-retry: when the conversation ends in a Blender
+    # RUNTIME traceback, fix the failing script with ONE local 'RUNTIME
+    # FIX' inference and forge the corrected tool payload directly — no
+    # extra round trip through the backend (core/relay_autofix.py). Every
+    # failure mode degrades to the plain relay below, so the error path
+    # can never be stranded.
+    try:
+        forged = relay_autofix.maybe_forge(bytes(body), pinned_url,
+                                           RELAY_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 — fail-open like the gate
+        logger.warning("%s auto-retry skipped (%s)", LOG_PREFIX, exc)
+        forged = None
+    if forged is not None:
+        respond({
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
+            "body": forged.decode("utf-8"),
+        })
+        return
+
     if goal_changed and GATE_CACHE_CLEAR_ON_NEW_GOAL:
         # A new goal: drop the previous goal's KV cache on the server so
         # the fresh context starts clean. Best-effort, silent on 404.
@@ -365,14 +401,25 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
         method="POST",
     )
     try:
+        t0 = time.monotonic()
         response = _urlopen(request, timeout=RELAY_TIMEOUT_S)
     except urllib.error.HTTPError as http_error:
         # Non-2xx passes through as a normal result — the backend SDK
         # understands provider error statuses (429, 400, ...).
+        logger.info("%s local model responded in %.1fs (HTTP %s)",
+                    LOG_PREFIX, time.monotonic() - t0, http_error.code)
         response = http_error
     except Exception as exc:
-        logger.warning("%s relay transport failure: %s", LOG_PREFIX, exc)
-        respond(_error("relay_transport", f"local server unreachable: {exc}"))
+        if relay_stop.is_stopped():
+            # relay_stop.stop_inflight() closed the tracked socket on
+            # purpose — this is a user stop, not a real failure.
+            logger.info("%s Stop — in-flight local-model call aborted "
+                        "(%s)", LOG_PREFIX, exc.__class__.__name__)
+            respond(_error("relay_stopped", "generation stopped by the user"))
+        else:
+            logger.warning("%s relay transport failure: %s", LOG_PREFIX, exc)
+            respond(_error("relay_transport",
+                           f"local server unreachable: {exc}"))
         return
 
     try:
@@ -382,7 +429,15 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
             status = response.getcode()
         headers = _filter_response_headers(response.headers)
     except Exception as exc:
-        respond(_error("relay_transport", f"error reading response: {exc}"))
+        # A forced close during the read (stop_inflight) surfaces here as a
+        # raw socket OSError — translate it exactly like the open phase.
+        if relay_stop.is_stopped():
+            logger.info("%s Stop — in-flight local-model read aborted "
+                        "(%s)", LOG_PREFIX, exc.__class__.__name__)
+            respond(_error("relay_stopped", "generation stopped by the user"))
+        else:
+            respond(_error("relay_transport",
+                           f"error reading response: {exc}"))
         return
     finally:
         try:
@@ -400,6 +455,8 @@ def handle_llm_request(params: dict, respond: Callable[[dict], None]) -> None:
         message_gate.inspect_response(raw)
     except Exception as exc:
         logger.debug("%s response audit skipped (%s)", LOG_PREFIX, exc)
+    logger.info("%s local model call completed in %.1fs (HTTP %s)",
+                LOG_PREFIX, time.monotonic() - t0, int(status))
     respond({
         "status_code": int(status),
         "headers": headers,

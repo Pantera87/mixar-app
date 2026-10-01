@@ -14,7 +14,10 @@ through — and replaces the optional ``rag/mixar-rag-server.py`` bridge:
   ``tools`` list or its ``arguments`` are not valid JSON (the tool-result
   message that answered a quarantined call is removed too, so the history
   stays a valid OpenAI pairing). Schema / required-key mismatches and
-  script bodies are audited (logged) but never touched.
+  script bodies are audited (logged) but never touched. It also shrinks the prefill (part A): only the system
+  messages plus the last ``HISTORY_TAIL`` non-system messages are sent
+  upstream, and tool-result content over ``TOOL_RESULT_MAX_CHARS`` is
+  head/tail-trimmed.
 * :func:`inspect_response` — log-only audit of the model output: every
   fenced Python block and every script argument of a returned
   ``tool_call`` is run through the space_mixie_chat script validator (the
@@ -51,6 +54,18 @@ _FENCED_RE = re.compile(r"```(?:python|py)\b[^\n]*\n(.*?)```",
 # How many validator issues we log per script block (this is telemetry,
 # not the gate — the executor's prepare_script() is what enforces).
 _MAX_LOGGED_ISSUES = 5
+
+# --- Prefill reduction (part A: shrink the request, never the semantics) ---
+# How many NON-SYSTEM messages of the conversation to keep in the outbound
+# request. The model only needs the recent context, not the full history —
+# the tail carries the live tool loop. The window is extended backward
+# across tool results so OpenAI call/result pairing stays valid.
+HISTORY_TAIL = 4
+# Head/tail cap for a single tool-result message: huge executor output
+# (tracebacks, file dumps) is the main prefill bloat, and only the head
+# (where a traceback starts) and the tail (where the final error is)
+# matter to the model.
+TOOL_RESULT_MAX_CHARS = 2000
 
 _state_lock = threading.Lock()
 _last_goal_hash: Optional[str] = None
@@ -211,6 +226,76 @@ def _quarantine(messages: list, declared: set, schemas: dict) -> Tuple[list, int
     return out, quarantined
 
 
+def _prefill_reduce(messages: list) -> Tuple[list, int]:
+    """Shrink the conversation for prefill (part A):
+
+    * keep every ``system`` message plus only the last ``HISTORY_TAIL``
+      non-system messages, extending the window backward across tool
+      results so a tool result never orphans its assistant tool_call;
+    * head/tail-trim any tool-result content above
+      ``TOOL_RESULT_MAX_CHARS``.
+
+    Returns ``(reduced, n_changed)`` where ``n_changed`` is the number of
+    messages dropped or trimmed. Never raises; any surprise degrades to
+    "pass through".
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages, 0
+    changed = 0
+    try:
+        non_system = [
+            i for i, message in enumerate(messages)
+            if not (isinstance(message, dict) and message.get("role") == "system")
+        ]
+        keep_from = max(0, len(non_system) - HISTORY_TAIL)
+        window_start = (
+            non_system[keep_from] if keep_from < len(non_system) else None
+        )
+        if window_start is not None:
+            # extend backward: the window must not start on a tool result
+            # whose answering assistant call is outside the window
+            while window_start > 0:
+                head = messages[window_start]
+                if (isinstance(head, dict)
+                        and head.get("role") in ("tool", "function")):
+                    window_start -= 1
+                    continue
+                break
+            if window_start < non_system[keep_from]:
+                changed += non_system[keep_from] - window_start
+        kept = []
+        for index, message in enumerate(messages):
+            if isinstance(message, dict) and message.get("role") == "system":
+                kept.append(message)
+                continue
+            if window_start is not None and index >= window_start:
+                kept.append(message)
+                continue
+            if window_start is not None:
+                changed += 1          # dropped from the head
+        # oversized tool results -> head + tail
+        trimmed_kept: List[Any] = []
+        for message in kept:
+            if (isinstance(message, dict)
+                    and message.get("role") in ("tool", "function")):
+                content = message.get("content")
+                if (isinstance(content, str)
+                        and len(content) > TOOL_RESULT_MAX_CHARS):
+                    half = TOOL_RESULT_MAX_CHARS // 2
+                    marker = ("\n... [%d chars truncated] ...\n"
+                              % (len(content) - TOOL_RESULT_MAX_CHARS))
+                    reduced = dict(message)
+                    reduced["content"] = (
+                        content[:half] + marker + content[-half:])
+                    trimmed_kept.append(reduced)
+                    changed += 1
+                    continue
+            trimmed_kept.append(message)
+        return trimmed_kept, changed
+    except Exception:
+        return messages, 0
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -219,12 +304,15 @@ def inspect_request(body: bytes) -> Tuple[bytes, bool]:
     """Gate one inbound chat-completions request body.
 
     Returns ``(body_out, goal_changed)``: ``body_out`` is the body to send
-    upstream (quarantined history re-serialized only when something was
-    removed), ``goal_changed`` is True when the last user message differs
-    from the one seen on the previous request — a goal boundary where the
-    relay may clear the local server's prompt cache. Never raises; a body
-    that cannot be parsed is returned untouched with ``goal_changed``
-    False."""
+    upstream — re-serialized ONLY when the quarantine or the prefill
+    reduction actually changed the history (system messages + the last
+    ``HISTORY_TAIL`` non-system messages, oversized tool results
+    head/tail-trimmed) — and ``goal_changed`` is True when the last user
+    message differs from the one seen on the previous request, a goal
+    boundary where the relay may clear the local server's prompt cache.
+    Never raises; a body that cannot be parsed is returned untouched with
+    ``goal_changed`` False.
+    """
     global _last_goal_hash
     try:
         obj = json.loads(body.decode("utf-8"))
@@ -259,16 +347,21 @@ def inspect_request(body: bytes) -> Tuple[bytes, bool]:
                             and digest != _last_goal_hash)
             _last_goal_hash = digest
 
-    # ---- quarantine pass (re-serializes only when something changed) ----
+    # ---- history shaping (re-serializes only when something changed) ----
     if not isinstance(messages, list):
         return body, goal_changed
     declared = _declared_tool_names(obj)
     schemas = _tool_schemas(obj)
     out_messages, quarantined = _quarantine(messages, declared, schemas)
-    if not quarantined:
+    if quarantined:
+        logger.info("%s quarantined %d hallucinated tool_call(s) from history",
+                    LOG_PREFIX, quarantined)
+    out_messages, reduced = _prefill_reduce(out_messages)
+    if not quarantined and not reduced:
         return body, goal_changed
-    logger.info("%s quarantined %d hallucinated tool_call(s) from history",
-                LOG_PREFIX, quarantined)
+    if reduced:
+        logger.info("%s prefill reduction: %d message(s) dropped/trimmed",
+                    LOG_PREFIX, reduced)
     new_obj = dict(obj)
     new_obj["messages"] = out_messages
     new_body = json.dumps(new_obj, ensure_ascii=False).encode("utf-8")

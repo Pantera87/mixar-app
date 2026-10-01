@@ -52,6 +52,23 @@ def is_interjection(scene):
     return session.get_state(scene) == SessionState.BUSY and session.run_open(scene)
 
 
+def _clear_relay_stop() -> None:
+    """Drop the local-model relay stop latch before a fresh user message.
+
+    A user typing a new message always means "run it", even right after
+    a Stop. Fail-open: a relay import problem must never block sending.
+    """
+    try:
+        from mixar.modules.local_models.core import relay_stop
+        relay_stop.clear_stop()
+    except Exception as exc:
+        try:
+            from mixar.modules.common.core.utils.logging import get_logger
+            get_logger(__name__).debug("clear_stop skipped: %s", exc)
+        except Exception:  # noqa: BLE001 — logging must never block sending
+            pass
+
+
 def send_user_message(scene, msg):
     from mixar.modules.common.agent_rpc.client import get_client
     from .turn_transport import create_turn_handler
@@ -60,6 +77,9 @@ def send_user_message(scene, msg):
     allowed, reason = can_send(scene)
     if not allowed:
         return False, reason
+    # A new user message clears any latched local-model stop (Stop button,
+    # New Chat, session switch) — the fresh turn must be allowed to relay.
+    _clear_relay_stop()
     try:
         client = get_client()
     except Exception as exc:

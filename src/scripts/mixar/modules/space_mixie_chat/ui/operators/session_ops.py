@@ -23,6 +23,32 @@ from ...constants import DEV_MODE, SessionState
 logger = get_logger(__name__)
 
 
+def _stop_relay_inflight() -> None:
+    """Kill any in-flight local-model inference in the in-app relay.
+
+    Called on Stop / New Chat / session switch: closes every live tracked
+    connection so llama.cpp aborts its decode within ~1 s. The relay's
+    transport error then surfaces as a clean ``relay_stopped`` and the
+    latched stop flag refuses further relay work until the next user
+    message clears it. Fail-open: an import problem must never block the
+    operator itself.
+    """
+    try:
+        from mixar.modules.local_models.core import relay_stop
+        relay_stop.stop_inflight()
+    except Exception as exc:  # noqa: BLE001 — never block the operator
+        logger.debug("stop_inflight skipped: %s", exc)
+
+
+def _clear_relay_stop() -> None:
+    """Clear the relay stop latch (new user message / resume intent)."""
+    try:
+        from mixar.modules.local_models.core import relay_stop
+        relay_stop.clear_stop()
+    except Exception as exc:  # noqa: BLE001 — never block the operator
+        logger.debug("clear_stop skipped: %s", exc)
+
+
 def send_cancel_request_async(session_id: str) -> None:
     """Send a cancel request to the backend in a background thread.
 
@@ -32,6 +58,7 @@ def send_cancel_request_async(session_id: str) -> None:
     """
     if not session_id:
         return
+    _stop_relay_inflight()
 
     import threading
     thread = threading.Thread(
@@ -426,6 +453,10 @@ class MIXIE_CHAT_OT_resume_previous_task(Operator):
         from ...constants import TEMP_PLACEHOLDER_PREFIX
         from ...core.turn_transport import create_turn_handler
         from mixar.config.config import get_server_url
+
+        # The user wants the (local) run to CONTINUE: drop any stop latch
+        # a previous Stop set, or a fresh resume can never relay again.
+        _clear_relay_stop()
 
         scene = context.scene
         session = get_session_manager()
