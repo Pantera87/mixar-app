@@ -226,6 +226,11 @@ COLLECTION_MAP = {
     ("Mesh", "vertices"): "MeshVertex",
     ("Mesh", "edges"): "MeshEdge",
     ("Mesh", "loops"): "MeshLoop",
+    # MeshPolygon IS in the truth table (42 attrs) — mapping it makes
+    # per-polygon loop variables (for p in mesh.polygons) verifiable
+    # instead of silently unchecked (that hole let a runtime-fatal
+    # "for face in mesh.polygons: face.normal_update()" through the gate).
+    ("Mesh", "polygons"): "MeshPolygon",
     ("Scene", "objects"): "Object",
     ("Scene", "view_layers"): "ViewLayer",
     ("Collection", "all_objects"): "Object",
@@ -439,6 +444,28 @@ def _expr_class(value, var_map):
     root, parts = _parse_parent(value)
     if root is None:
         return None
+    # obj.modifiers.new(name, type='OCEAN') — the type argument names the
+    # concrete modifier class (Blender's modifier RNA enum). The result
+    # was previously untyped, so property TYPE checks (e.g. a float literal
+    # assigned to an INT property like OceanModifier.spatial_size) were
+    # silently skipped on modifier variables.
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Attribute) \
+            and value.func.attr == "new":
+        names = _chain_names(value.func.value)
+        if len(names) >= 2 and names[-2] == "modifiers" and \
+                isinstance(root, str) and parts and parts[0][0] == "attr" \
+                and parts[0][1] == "modifiers":
+            type_arg = None
+            if len(value.args) >= 2 and isinstance(value.args[1], ast.Constant):
+                type_arg = value.args[1].value
+            else:
+                for kw in value.keywords:
+                    if kw.arg == "type" and isinstance(kw.value, ast.Constant):
+                        type_arg = kw.value.value
+            if isinstance(type_arg, str):
+                for cand in (f"{type_arg}Modifier", type_arg):
+                    if cand in BPy_NAMES:
+                        return BPy_NAMES[cand]
     cls, last = _state_of(root, parts, var_map)
     if cls is None:
         return None
@@ -836,10 +863,14 @@ def validate_bpy_properties(script: str):
     assign_rhs = {}
     readonly_targets = {}   # id(leaf attr node of a WRITE TARGET) -> readonly issue text
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AugAssign)) and node.value is not None \
-                and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute):
-            assign_rhs[id(node.targets[0])] = node.value
-            tgt = node.targets[0]
+        if isinstance(node, ast.Assign):
+            tgt = node.targets[0] if len(node.targets) == 1 else None
+        elif isinstance(node, ast.AugAssign):
+            tgt = node.target
+        else:
+            tgt = None
+        if tgt is not None and isinstance(tgt, ast.Attribute) and node.value is not None:
+            assign_rhs[id(tgt)] = node.value
             try:
                 root, parts = _parse_parent(tgt)
                 cls_r, leaf_r = _state_of(root, parts, var_class)
@@ -983,6 +1014,22 @@ def validate_bpy_properties(script: str):
                              f"(.new('{type_str}') fails at runtime with \"type undefined\")."
                              + (f" Did you mean: {', '.join(BPy_NAMES[c] for c in close)}?" if close else ""))
 
+            # .normal_update(): the attribute is not on ANY class in the
+            # binary-dumped truth table (the MeshPolygons collection class
+            # is absent from this build), so every form of the call —
+            # mesh.polygons.normal_update() or the per-polygon
+            # "for f in mesh.polygons: f.normal_update()" the generation
+            # model keeps emitting — dies at runtime with AttributeError.
+            # Face normals derive from the face data itself (from_pydata()
+            # already sets it up) — no explicit recompute call exists.
+            if isinstance(node.func, ast.Attribute) and node.func.attr == "normal_update":
+                add("- normal_update: no class in this Mixar build has normal_update() "
+                    "(the MeshPolygons collection class is not in the binary-dumped truth "
+                    "table), so mesh.polygons.normal_update() and per-polygon calls like "
+                    "'for f in mesh.polygons: f.normal_update()' both crash at runtime "
+                    "(AttributeError). DELETE the call — face normals are computed from "
+                    "the face data set by from_pydata(), nothing else is needed.")
+
         elif isinstance(node, ast.Subscript):
             # socket-name validation + subscript-TARGET validation
             root, parts = _parse_parent(node.value)
@@ -1055,6 +1102,11 @@ def normalize_mixar_script(script):
     T2  bpy.data.sounds.new(...) usage -> lines deleted, scene-level
         audio inserted (no sound data-blocks in this build:
          attribute 'new' not found)
+    T5  for X in *.polygons:  X.normal_update()  ->  loop replaced by pass
+        (MeshPolygon has no normal_update in this build — it is a
+        MeshPolygons collection API — and face normals are already
+        derived from the from_pydata() face data, so the loops were
+        runtime-fatal no-ops)
     """
     notes = []
     if not script or not script.strip():
@@ -1354,6 +1406,52 @@ def normalize_mixar_script(script):
         tree.body = new_body
         changed = True
         notes.extend(ocean_fixes)
+
+    # ---- T5: per-polygon .normal_update() loop --------------------------
+    # The generation model (trained on stock-Blender tutorials) emits
+    #     for face in mesh.polygons:
+    #         face.normal_update()
+    # MeshPolygon has no normal_update() in this build — that is a
+    # MeshPolygons COLLECTION method in stock Blender — so the per-polygon
+    # form dies at runtime (AttributeError). The loop is a no-op anyway:
+    # face normals derive from the from_pydata() face data. Replace it
+    # with pass so the generated script runs.
+    class _NormalUpdateLoopDrop(ast.NodeTransformer):
+        n = 0
+        def visit_For(self, node):
+            node = self.generic_visit(node)
+            it = node.iter
+            if isinstance(it, ast.Call) and isinstance(it.func, ast.Name) \
+                    and it.func.id == "list" and it.args:
+                it = it.args[0]
+            if not (isinstance(it, ast.Attribute) and it.attr == "polygons"
+                    and isinstance(node.target, ast.Name) and not node.orelse):
+                return node
+            if len(node.body) != 1:
+                return node
+            b = node.body[0]
+            if not (isinstance(b, ast.Expr) and isinstance(b.value, ast.Call)):
+                return node
+            f = b.value.func
+            if not (isinstance(f, ast.Attribute) and f.attr == "normal_update"
+                    and isinstance(f.value, ast.Name)
+                    and f.value.id == node.target.id
+                    and not b.value.args and not b.value.keywords):
+                return node
+            self.n += 1
+            p = ast.parse("pass").body[0]
+            p.col_offset, p.end_col_offset = node.col_offset, node.end_col_offset
+            return p
+
+    dropper = _NormalUpdateLoopDrop()
+    tree = dropper.visit(tree)
+    if dropper.n:
+        changed = True
+        notes.append(f"{dropper.n} per-polygon normal_update() loop(s) removed "
+                     f"(MeshPolygon has no normal_update in this build — it is a "
+                     f"MeshPolygons collection API, and face normals are already "
+                     f"derived from the from_pydata() face data, so the loops "
+                     f"were no-ops)")
 
     if not changed:
         return script, notes

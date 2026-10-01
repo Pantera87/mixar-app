@@ -441,9 +441,19 @@ def _resolve_bpy_class(candidate: str):
 # 4. LEMONADE LLM CLIENT
 # ============================================================
 LEMONADE_PORT = "13305"
+# Hard cap on a single Lemonade call. The openai client's default (600 s)
+# lets a slow/stalled local model hold the request until Mixar's own backend
+# gives up with "OpenAI did not respond in time" long before it would fail
+# on its own.
+LLM_TIMEOUT_S = 120.0
+# How many of the most recent conversation messages are forwarded to the
+# local model (see _history_tail). Completed earlier rounds are dropped so
+# the prompt — and the model server's cache — never grows across rounds.
+HISTORY_TAIL = 6
 llm_client = openai.OpenAI(
     base_url=f"http://127.0.0.1:{LEMONADE_PORT}/v1",
-    api_key="not-needed"
+    api_key="not-needed",
+    timeout=LLM_TIMEOUT_S
 )
 
 MAX_ATTEMPTS = 2       # max consecutive Blender runtime failures before stopping the chain
@@ -595,6 +605,10 @@ COLLECTION_MAP = {
     ("Mesh", "vertices"): "MeshVertex",
     ("Mesh", "edges"): "MeshEdge",
     ("Mesh", "loops"): "MeshLoop",
+    # MeshPolygon IS in the truth table (42 attrs) — mapping it makes
+    # per-polygon loop variables (for p in mesh.polygons) verifiable
+    # instead of silently unchecked.
+    ("Mesh", "polygons"): "MeshPolygon",
     ("Scene", "objects"): "Object",
     ("Scene", "view_layers"): "ViewLayer",
     ("Collection", "all_objects"): "Object",
@@ -1205,10 +1219,14 @@ def validate_bpy_properties(script: str):
     assign_rhs = {}
     readonly_targets = {}   # id(leaf attr node of a WRITE TARGET) -> readonly issue text
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AugAssign)) and node.value is not None \
-                and len(node.targets) == 1 and isinstance(node.targets[0], ast.Attribute):
-            assign_rhs[id(node.targets[0])] = node.value
-            tgt = node.targets[0]
+        if isinstance(node, ast.Assign):
+            tgt = node.targets[0] if len(node.targets) == 1 else None
+        elif isinstance(node, ast.AugAssign):
+            tgt = node.target
+        else:
+            tgt = None
+        if tgt is not None and isinstance(tgt, ast.Attribute) and node.value is not None:
+            assign_rhs[id(tgt)] = node.value
             try:
                 root, parts = _parse_parent(tgt)
                 cls_r, leaf_r = _state_of(root, parts, var_class)
@@ -1785,14 +1803,57 @@ def _break_response(model: str, content: str, rid: str) -> dict:
     }
 
 
+def _history_tail(messages, tail=HISTORY_TAIL):
+    """Bound what the local model sees on every request.
+
+    Mixar's agent resends the ENTIRE conversation on every turn, so without
+    this the local model re-prefills every earlier round on every request:
+    round 2 carries round 1's messages, round 3 carries both, and so on —
+    that growth is exactly what makes each round slower than the last,
+    until Mixar's backend gives up with 'did not respond in time'.
+
+    Generation only needs the current turn: the latest goal plus the newest
+    tool results, which are always at the END of the list. Everything from
+    completed earlier rounds is dropped here — effectively clearing the
+    conversation cache after every finished inference — while leading system
+    messages are kept (they are identical every round, so the model server's
+    prompt cache still hits on them).
+    """
+    non_system = [m for m in messages if m.role != "system"]
+    if len(non_system) <= tail:
+        return list(messages)
+    systems = [m for m in messages if m.role == "system"]
+    return systems + non_system[-tail:]
+
+
+def _llm_create(model_id, messages, timeout=LLM_TIMEOUT_S):
+    """One OpenAI-compatible completion call against the local model.
+
+    Every call goes through here so the hard per-call timeout
+    (LLM_TIMEOUT_S) can never be bypassed, and so a stalled local model
+    fails fast with a clear 504 instead of hanging until Mixar's own
+    timeout fires ('OpenAI did not respond in time').
+    """
+    try:
+        return llm_client.chat.completions.create(
+            model=model_id, messages=_inject_thinking(messages),
+            temperature=0.0, stream=False, timeout=timeout
+        )
+    except (openai.APITimeoutError, openai.APIConnectionError) as e:
+        print(f"❌ Lemonade (port {LEMONADE_PORT}) — {e.__class__.__name__} after {timeout}s")
+        raise HTTPException(
+            status_code=504,
+            detail=(f"Local model did not respond within {timeout:g}s. "
+                    "Check that Lemonade / llama-server is running and not stuck on "
+                    "another request, then try again."),
+        ) from e
+
+
 def _llm_chat(messages, model_id, label):
     """One Lemonade call with thinking control injected + no-script retry.
     Returns (content, reasoning)."""
     print(f"👉 {label} (model: {model_id}, thinking: {THINKING_MODE})...")
-    resp = llm_client.chat.completions.create(
-        model=model_id, messages=_inject_thinking(messages),
-        temperature=0.0, stream=False
-    )
+    resp = _llm_create(model_id, messages)
     msg = resp.choices[0].message
     content = msg.content or ""
     reasoning = _reasoning_of(msg)
@@ -1811,10 +1872,7 @@ def _llm_chat(messages, model_id, label):
                 "properties, steps or a plan. Output ONLY the complete final script inside one "
                 "```python fence, starting with `import bpy`. Code only."}
         ]
-        resp2 = llm_client.chat.completions.create(
-            model=model_id, messages=_inject_thinking(retry_msgs),
-            temperature=0.0, stream=False
-        )
+        resp2 = _llm_create(model_id, retry_msgs)
         msg2 = resp2.choices[0].message
         content2 = msg2.content or ""
         reasoning2 = _reasoning_of(msg2)
@@ -2180,13 +2238,10 @@ def _doc_phase_bypass(request_model: str, messages) -> dict:
     content = ""
     try:
         plain = [{"role": m.role, "content": m.content or ""}
-                 for m in messages
+                 for m in _history_tail(messages)
                  if m.role in ("system", "user", "assistant") and (m.content or "")]
         if plain:
-            resp = llm_client.chat.completions.create(
-                model=request_model, messages=_inject_thinking(plain),
-                temperature=0.0, stream=False,
-            )
+            resp = _llm_create(request_model, plain)
             content = (resp.choices[0].message.content or "").strip()
     except Exception as e:
         print(f"⚠️ Doc-phase pass-through call failed: {e}")
@@ -2466,9 +2521,16 @@ async def chat_completions(request: ChatCompletionRequest):
         )
 
         final_messages = [{"role": "system", "content": rag_system_prompt}]
-        for msg in request.messages:
+        # Only the tail of the conversation reaches the local model: completed
+        # earlier rounds are dropped (see _history_tail) so round 5 is no
+        # slower than round 1.
+        tail_msgs = _history_tail(request.messages)
+        for msg in tail_msgs:
             if msg.role != "system":
                 final_messages.append({"role": msg.role, "content": msg.content or ""})
+        print(f"✂️ HISTORY TRIM — {len(request.messages)} incoming message(s), "
+              f"{sum(1 for m in tail_msgs if m.role != 'system')} kept for the local model "
+              f"(tail limit: {HISTORY_TAIL})")
 
         generated_text, _ = _llm_chat(final_messages, request.model, "GENERATION")
         pure_script, norm_notes = normalize_mixar_script(extract_pure_script(generated_text))
